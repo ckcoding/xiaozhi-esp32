@@ -226,37 +226,50 @@ class Charge : public I2cDevice {
 public:
     Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
     {
-        read_buffer_ = new uint8_t[8];
     }
-    ~Charge()
+
+    void Update()
     {
-        delete[] read_buffer_;
-    }
-    void Printcharge()
-    {
+        // 读取 I2C 寄存器获取电压电流数据
         ReadRegs(0x08, read_buffer_, 2);
         ReadRegs(0x0c, read_buffer_ + 2, 2);
-        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
-
-        int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
-        int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
         
-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
-        (void)voltage;
-        (void)current;
-    }
-    static void TaskFunction(void *pvParameters)
-    {
-        Charge* charge = static_cast<Charge*>(pvParameters);
-        while (true) {
-            charge->Printcharge();
-            vTaskDelay(pdMS_TO_TICKS(300));
+        // 转换数据 (假设是 mV)
+        voltage_mV_ = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
+        // 读取电流 (假设单位 mA，有符号)
+        current_mA_ = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
+
+        // 简单的线性计算电量百分比 (3.3V - 4.2V)
+        if (voltage_mV_ >= 4100) {
+            percentage_ = 100;
+        } else if (voltage_mV_ <= 3300) {
+            percentage_ = 0;
+        } else {
+            percentage_ = (voltage_mV_ - 3300) * 100 / (4100 - 3300);
         }
+
+        // 判断充电状态
+        // 假设电流 > 50mA 为充电 (根据硬件特性可能需要调整)
+        is_charging_ = (current_mA_ > 50); 
+        // 也可以结合电压辅助判断，例如电压一直很高
     }
+
+    void GetBatteryInfo(int &level, bool &charging) {
+        level = percentage_;
+        charging = is_charging_;
+    }
+
+    int16_t GetCurrent() { return current_mA_; }
 
 private:
-    uint8_t* read_buffer_ = nullptr;
+    uint8_t read_buffer_[4];
+    int percentage_ = 100;
+    uint16_t voltage_mV_ = 4200;
+    int16_t current_mA_ = 0;
+    bool is_charging_ = false;
 };
+
+// ... (Cst816s update skippied as it is unchanged, referring to original file content if needed) ...
 
 class Cst816s : public I2cDevice {
 public:
@@ -275,7 +288,6 @@ public:
 
     Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
     {
-        read_buffer_ = new uint8_t[6];
         was_touched_ = false;
         press_count_ = 0;
 
@@ -288,8 +300,6 @@ public:
 
     ~Cst816s()
     {
-        delete[] read_buffer_;
-
         // Delete semaphore if it exists
         if (touch_isr_mux_ != NULL) {
             vSemaphoreDelete(touch_isr_mux_);
@@ -369,7 +379,7 @@ public:
     }
 
 private:
-    uint8_t* read_buffer_ = nullptr;
+    uint8_t read_buffer_[6];
     TouchPoint_t tp_;
 
     // Touch state tracking
@@ -391,6 +401,10 @@ private:
     esp_timer_handle_t touchpad_timer_;
     esp_lcd_touch_handle_t tp;   // LCD touch handle
     Esp32Camera* camera_ = nullptr;
+    
+    // 记录最后一次交互时间 (tick count)
+    uint32_t last_interaction_tick_ = 0;
+    bool screen_off_ = false;
 
     void InitializeI2c()
     {
@@ -471,6 +485,14 @@ private:
                 auto &app = Application::GetInstance();
                 auto &board = (EchoEar &)Board::GetInstance();
 
+                // 更新交互时间
+                board.last_interaction_tick_ = xTaskGetTickCount();
+                // 唤醒屏幕如果已关闭
+                if (board.screen_off_) {
+                    board.screen_off_ = false;
+                    board.GetBacklight()->RestoreBrightness();
+                }
+
                 ESP_LOGI(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
                 touchpad->UpdateTouchPoint();
                 auto touch_event = touchpad->CheckTouchEvent();
@@ -486,10 +508,82 @@ private:
         }
     }
 
+    static void power_save_task(void* arg) {
+        EchoEar* board = static_cast<EchoEar*>(arg);
+        
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
+            
+            // 手动执行 Charge 的更新 (因为我们移除了它独立的任务)
+            if (board->charge_) {
+                board->charge_->Update();
+            }
+
+            int battery_level = 0;
+            bool charging = false;
+            if (board->charge_) {
+                board->charge_->GetBatteryInfo(battery_level, charging);
+            }
+
+            auto& app = Application::GetInstance();
+            auto state = app.GetDeviceState();
+
+            // 如果正在充电 -> 始终亮屏，保持唤醒
+            if (charging) {
+                if (board->screen_off_) {
+                    board->screen_off_ = false;
+                    board->GetBacklight()->RestoreBrightness();
+                }
+                // 充电时重置计时器，防止拔掉瞬间立即熄灭
+                board->last_interaction_tick_ = xTaskGetTickCount();
+                continue;
+            }
+
+            // 如果未充电
+            // 检测是否处于非空闲状态 (Listening/Speaking)，视为正在使用，刷新计时器
+            if (state == kDeviceStateListening || state == kDeviceStateSpeaking || state == kDeviceStateConnecting) {
+                board->last_interaction_tick_ = xTaskGetTickCount();
+            }
+            
+            // 检查超时 (15秒 = 15000ms)
+            uint32_t now = xTaskGetTickCount();
+            uint32_t diff = (now - board->last_interaction_tick_) * portTICK_PERIOD_MS;
+
+            if (diff > 15000) {
+                // 超时处理
+                if (!board->screen_off_) {
+                    ESP_LOGI(TAG, "Auto screen off after 15s inactivity");
+                    // 1. 退出对话状态
+                    if (state != kDeviceStateIdle) {
+                        app.SetDeviceState(kDeviceStateIdle);
+                    }
+                    // 2. 关闭屏幕
+                    board->GetBacklight()->SetBrightness(0);
+                    board->screen_off_ = true;
+                }
+            } else {
+                // 未超时，确保屏幕开启 (如果之前关了，这里可能需要唤醒吗？通常通过触摸唤醒)
+                // 这里不做自动唤醒，只做自动关闭。唤醒由 touch_event_task 或 语音动作触发。
+                // 如果应用层主要状态变化了(例如语音唤醒)，应该重置 diff。
+                // *补充*: 如果 Application 变为 Listening (语音唤醒)，上面的 if state... 会重置计时器
+                // 但是如果屏幕是黑的，语音唤醒后应该点亮屏幕：
+                if (state != kDeviceStateIdle && board->screen_off_) {
+                    board->screen_off_ = false;
+                    board->GetBacklight()->RestoreBrightness();
+                }
+            }
+        }
+    }
+
     void InitializeCharge()
     {
         charge_ = new Charge(i2c_bus_, 0x55);
-        xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, NULL, 0);
+        // Task moved to power_save_task loop
+        // xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, NULL, 0);
+        
+        // 启动电源管理任务
+        last_interaction_tick_ = xTaskGetTickCount();
+        xTaskCreatePinnedToCore(power_save_task, "power_save", 3 * 1024, this, 1, NULL, 0);
     }
 
     void InitializeCst816sTouchPad()
@@ -567,6 +661,16 @@ private:
     {
         boot_button_.OnClick([this]() {
             auto &app = Application::GetInstance();
+            
+            // 按键唤醒屏幕
+            last_interaction_tick_ = xTaskGetTickCount();
+            if (screen_off_) {
+                screen_off_ = false;
+                backlight_->RestoreBrightness();
+                // 唤醒只亮屏，不触发其他操作，或者视情况而定？
+                // 根据当前逻辑，如果不触发其他操作，按键原本逻辑还是会执行
+            }
+
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
                 EnterWifiConfigMode();
@@ -660,6 +764,16 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override
+    {
+        if (charge_) {
+            charge_->GetBatteryInfo(level, charging);
+            discharging = !charging;
+            return true;
+        }
+        return false;
     }
 };
 
