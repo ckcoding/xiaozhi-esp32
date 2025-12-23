@@ -7,6 +7,7 @@
 #include "config.h"
 #include "backlight.h"
 #include "esp32_camera.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 
@@ -288,7 +289,10 @@ public:
         GESTURE_FLIP,        // 翻转（屏幕朝下）
         GESTURE_UNFLIP,      // 翻转恢复（屏幕朝上）
         GESTURE_SHAKE,       // 摇晃
-        GESTURE_TAP          // 敲击
+        GESTURE_FAST_SHAKE,  // 快速摇晃 (交互触发)
+        GESTURE_DOUBLE_TAP,  // 双击
+        GESTURE_TAP,         // 单击
+        GESTURE_LIFT         // 抬腕/拿起
     };
 
     enum ChipType {
@@ -297,186 +301,327 @@ public:
         TYPE_BMI270
     };
 
-    Mpu6050(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
+    Mpu6050(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr), address_(addr), bus_handle_(i2c_bus)
     {
-        // 初始化MPU6050
         Init();
     }
 
     bool Init() {
-        // --- Try detecting BMI270 (Reg 0x00 = 0x24) ---
         uint8_t chip_id = 0;
-        ReadRegs(0x00, &chip_id, 1);
-        ESP_LOGI("IMU", "Check Reg 0x00 (BMI270 ID): 0x%02X", chip_id);
         
-        if (chip_id == 0x24) {
-            chip_type_ = TYPE_BMI270;
-            ESP_LOGW("IMU", "Detected BMI270 at 0x68. Firmware upload required but not implemented.");
-            ESP_LOGW("IMU", "BMI270 requires 8KB config blob upload - skipping for now.");
-            ESP_LOGW("IMU", "Flip-to-mute and shake-to-wake features will be disabled.");
-            
-            // Mark as not initialized - sensor detected but not usable
-            initialized_ = false;
-            return false;
-        }
-
-        // --- Fallback: Try MPU6050 (Reg 0x75 = 0x68) ---
+        ESP_LOGI("IMU", "=== IMU Init Start (addr=0x%02X) ===", address_);
+        
+        // 尝试读取 WHO_AM_I (0x75) - MPU6050
         ReadRegs(0x75, &chip_id, 1);
-        ESP_LOGI("IMU", "Check Reg 0x75 (MPU6050 ID): 0x%02X", chip_id);
+        ESP_LOGI("IMU", "Read WHO_AM_I (0x75): 0x%02X", chip_id);
         
         if (chip_id == 0x68 || chip_id == 0x11 || chip_id == 0x69) {
             chip_type_ = TYPE_MPU6050;
-            ESP_LOGI("IMU", "Detected MPU6050/ICM! Initializing...");
+            ESP_LOGI("IMU", "=== MPU6050/ICM Detected! ===");
+            ESP_LOGI(TAG, "  Vendor: InvenSense (TDK)");
             
             // MPU6050 Init Sequence
-            WriteReg(0x6B, 0x80); // Reset
+            WriteReg(0x6B, 0x00); // Wake up
             vTaskDelay(pdMS_TO_TICKS(100));
-            WriteReg(0x6B, 0x00); // Wake
-            vTaskDelay(pdMS_TO_TICKS(100));
-            WriteReg(0x6B, 0x01); // Clock Source
+            WriteReg(0x6B, 0x01); // Set Clock Source
             vTaskDelay(pdMS_TO_TICKS(10));
-            WriteReg(0x1C, 0x00); // Accel Range +/-2g
-            WriteReg(0x1B, 0x00); // Gyro Range +/-250
+            WriteReg(0x1C, 0x00); // Accel Range +/- 2g
+            WriteReg(0x1B, 0x00); // Gyro Range +/- 250 deg/s
             
+            ESP_LOGI("IMU", "MPU6050 configuration complete.");
+            initialized_ = true;
+            return true;
+        } 
+        
+        // 尝试读取 BMI270 Chip ID (0x00)
+        ReadRegs(0x00, &chip_id, 1);
+        ESP_LOGI("IMU", "Read Chip ID (0x00): 0x%02X", chip_id);
+        
+        if (chip_id == 0x24) {
+            chip_type_ = TYPE_BMI270;
+            ESP_LOGI("IMU", "=== BMI270 Detected! ===");
+            ESP_LOGI(TAG, "  Vendor: Bosch Sensortec");
+            
+            // ============================================
+            // BMI270 Full Initialization with Firmware Upload (Burst Write)
+            // ============================================
+            ESP_LOGI("IMU", "Uploading BMI270 firmware (Burst Write)...");
+
+            // Create a temporary device handle for raw burst writes
+            i2c_master_dev_handle_t bmi_dev_handle = nullptr;
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = address_,
+                .scl_speed_hz = 100000, // Safe speed for config upload
+            };
+            if (i2c_master_bus_add_device(bus_handle_, &dev_cfg, &bmi_dev_handle) != ESP_OK) {
+                ESP_LOGE("IMU", "Failed to create temp I2C device for BMI270");
+                return false;
+            }
+            
+            // Step 1: Soft Reset
+            // WriteReg(0x7E, 0xB6);
+            uint8_t reset_cmd[] = {0x7E, 0xB6};
+            i2c_master_transmit(bmi_dev_handle, reset_cmd, 2, -1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            
+            // Wait for boot (check status)
+            // Can use existing ReadRegs/WriteReg or the new handle
+            // Switch to new handle for consistency for Init sequence
+            
+            // Step 2: Disable advanced power save mode for config upload
+            uint8_t pwr_conf[] = {0x7C, 0x00};
+            i2c_master_transmit(bmi_dev_handle, pwr_conf, 2, -1);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            
+            // Step 3: Prepare for config load
+            uint8_t init_ctrl[] = {0x59, 0x00};
+            i2c_master_transmit(bmi_dev_handle, init_ctrl, 2, -1);
+            
+            // Step 4: Upload config file (8KB) using BURST Writes
+            const size_t config_size = 8192;
+            const size_t chunk_size = 64; // Max burst size
+            uint8_t burst_buffer[chunk_size + 1]; // Reg + Data
+
+            for (size_t offset = 0; offset < config_size; offset += chunk_size) {
+                // Set burst write address
+                uint8_t addr_low = (offset / 2) & 0x0F;
+                uint8_t addr_high = ((offset / 2) >> 4) & 0xFF;
+                
+                uint8_t set_addr_0[] = {0x5B, addr_low};
+                i2c_master_transmit(bmi_dev_handle, set_addr_0, 2, -1);
+                
+                uint8_t set_addr_1[] = {0x5C, addr_high};
+                i2c_master_transmit(bmi_dev_handle, set_addr_1, 2, -1);
+                
+                // Write chunk to INIT_DATA register (0x5E)
+                size_t current_chunk_size = (offset + chunk_size <= config_size) ? chunk_size : (config_size - offset);
+                
+                burst_buffer[0] = 0x5E; // INIT_DATA register
+                memcpy(&burst_buffer[1], &bmi270_config_file[offset], current_chunk_size);
+                
+                // Transmit [Reg, Data...] in one transaction
+                esp_err_t ret = i2c_master_transmit(bmi_dev_handle, burst_buffer, current_chunk_size + 1, -1);
+                if (ret != ESP_OK) {
+                     ESP_LOGE("IMU", "Firmware upload failed at offset %d: %s", offset, esp_err_to_name(ret));
+                     i2c_master_bus_rm_device(bmi_dev_handle);
+                     return false;
+                }
+            }
+            
+            // Step 5: Complete initialization
+            uint8_t init_complete[] = {0x59, 0x01};
+            i2c_master_transmit(bmi_dev_handle, init_complete, 2, -1);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            
+            // Cleanup temp handle
+            i2c_master_bus_rm_device(bmi_dev_handle);
+
+            // Step 6: Check INTERNAL_STATUS (back to standard methods)
+            uint8_t init_status = 0;
+            ReadRegs(0x21, &init_status, 1);
+            ESP_LOGI("IMU", "BMI270 Init Status (0x21): 0x%02X", init_status);
+
+            if ((init_status & 0x01) != 0x01) {
+                ESP_LOGE("IMU", "BMI270 init failed! Status: 0x%02X", init_status);
+                initialized_ = false;
+                return false;
+            }
+            ESP_LOGI("IMU", "BMI270 firmware upload complete.");
+            
+            // Step 7: Enable accelerometer
+            WriteReg(0x7D, 0x04);  // PWR_CTRL: enable ACC
+            vTaskDelay(pdMS_TO_TICKS(10));
+            
+            // Step 8: Configure accelerometer
+            // ACC_CONF (0x40): ODR=100Hz, BWP=normal, filter_perf=high
+            WriteReg(0x40, 0xA8);
+            // ACC_RANGE (0x41): +/- 2g
+            WriteReg(0x41, 0x00);
+            
+            ESP_LOGI("IMU", "BMI270 configuration complete.");
             initialized_ = true;
             return true;
         }
-        
-        ESP_LOGE("IMU", "Unknown IMU Device!");
+
+        ESP_LOGE("IMU", "=== NO IMU FOUND at 0x%02X! ===", address_);
+        initialized_ = false;
         return false;
     }
 
     void Update() {
-        if (!initialized_) return;
-        
-        int16_t ax_raw=0, ay_raw=0, az_raw=0;
-
-        if (chip_type_ == TYPE_BMI270) {
-            // BMI270 Data Registers: 0x0C (ACC_X_LSB)
-            uint8_t buffer[6];
-            ReadRegs(0x0C, buffer, 6);
-            ax_raw = (int16_t)((buffer[1] << 8) | buffer[0]); // Little Endian
-            ay_raw = (int16_t)((buffer[3] << 8) | buffer[2]);
-            az_raw = (int16_t)((buffer[5] << 8) | buffer[4]);
-            
-            // +/-2g range
-            ax_ = ax_raw / 16384.0f;
-            ay_ = ay_raw / 16384.0f;
-            az_ = az_raw / 16384.0f;
-            
-        } else if (chip_type_ == TYPE_MPU6050) {
-            // MPU6050 Data Registers: 0x3B (ACCEL_XOUT_H)
-            uint8_t buffer[6];
-            ReadRegs(0x3B, buffer, 6);
-            ax_raw = (int16_t)((buffer[0] << 8) | buffer[1]); // Big Endian
-            ay_raw = (int16_t)((buffer[2] << 8) | buffer[3]);
-            az_raw = (int16_t)((buffer[4] << 8) | buffer[5]);
-            
-            ax_ = ax_raw / 16384.0f;
-            ay_ = ay_raw / 16384.0f;
-            az_ = az_raw / 16384.0f;
+        if (!initialized_) {
+            static int not_init_counter = 0;
+            if (++not_init_counter >= 50) {
+                not_init_counter = 0;
+                ESP_LOGW("IMU", "Update skipped: NOT INITIALIZED! chip_type=%d", chip_type_);
+            }
+            return;
         }
+        
+        float ax_raw_f = 0, ay_raw_f = 0, az_raw_f = 0;
+        if (!ReadRawAccel(ax_raw_f, ay_raw_f, az_raw_f)) return;
 
-        // 检测翻转状态 (Z轴加速度)
-        bool new_flipped = (az_ < -0.7f);  // 屏幕朝下
+        // 1. 摇晃检测 (优先级最高！必须使用原始数据，避免滤波器平滑掉高频信号)
+        DetectShakeRaw(ax_raw_f, ay_raw_f, az_raw_f);
+
+        // 2. 低通滤波 (Alpha Filter) - 用于姿态判断
+        const float alpha = 0.2f;
+        ax_ = (1.0f - alpha) * ax_ + alpha * ax_raw_f;
+        ay_ = (1.0f - alpha) * ay_ + alpha * ay_raw_f;
+        float az_prev = az_;
+        az_ = (1.0f - alpha) * az_ + alpha * az_raw_f;
+
+        // 3. 抬腕检测 (从垂直/侧卧回到水平正面 Z ~ -1)
+        DetectLift();
+
+        // 4. 翻转检测 (监测面朝下 Z ~ +1)
+        DetectFlip();
+
+        // 5. 敲击检测 (最后检测，受 DetectShake 生成的屏蔽保护)
+        float az_delta = fabsf(az_raw_f - az_prev);
+        DetectTap(az_delta);
+
+        // 6. 调试输出 (减低频率)
+        static int debug_check_counter = 0;
+        if (++debug_check_counter >= 50) {
+            debug_check_counter = 0;
+            float mag = sqrtf(ax_*ax_ + ay_*ay_ + az_*az_);
+            ESP_LOGI("IMU_DEBUG", "Filt: X=%.2f Y=%.2f Z=%.2f Mag=%.2f Flip=%d", ax_, ay_, az_, mag, is_flipped_);
+        }
+    }
+
+private:
+    bool ReadRawAccel(float &ax, float &ay, float &az) {
+        int16_t rax=0, ray=0, raz=0;
+        uint8_t buffer[6];
+
+        if (chip_type_ == TYPE_MPU6050) {
+            ReadRegs(0x3B, buffer, 6);
+            rax = (int16_t)((buffer[0] << 8) | buffer[1]);
+            ray = (int16_t)((buffer[2] << 8) | buffer[3]);
+            raz = (int16_t)((buffer[4] << 8) | buffer[5]);
+        } else if (chip_type_ == TYPE_BMI270) {
+            ReadRegs(0x0C, buffer, 6);
+            rax = (int16_t)((buffer[1] << 8) | buffer[0]);
+            ray = (int16_t)((buffer[3] << 8) | buffer[2]);
+            raz = (int16_t)((buffer[5] << 8) | buffer[4]);
+        } else return false;
+
+        ax = rax / 16384.0f;
+        ay = ray / 16384.0f;
+        az = raz / 16384.0f;
+        return true;
+    }
+
+    void DetectFlip() {
+        // 根据实测：Z=-1 是正面，Z=+1 是背面。所以 Z > 0.5 为翻转朝下
+        bool new_flipped = (az_ > 0.5f);  
         if (new_flipped != is_flipped_) {
-            flip_stable_count_++;
-            if (flip_stable_count_ >= 3) {  // 稳定3次才改变状态
+            if (++flip_stable_count_ >= 3) {
                 is_flipped_ = new_flipped;
                 flip_stable_count_ = 0;
-                if (is_flipped_) {
-                    last_gesture_ = GESTURE_FLIP;
-                    ESP_LOGI("IMU", "Device flipped (face down)");
-                } else {
-                    last_gesture_ = GESTURE_UNFLIP;
-                    ESP_LOGI("IMU", "Device unflipped (face up)");
-                }
+                last_gesture_ = is_flipped_ ? GESTURE_FLIP : GESTURE_UNFLIP;
+                ESP_LOGI("IMU", "Flip Event: %s", is_flipped_ ? "FACE DOWN (Muted)" : "FACE UP (Active)");
             }
         } else {
             flip_stable_count_ = 0;
         }
+    }
+
+    void DetectShakeRaw(float ax_raw, float ay_raw, float az_raw) {
+        // 使用原始加速度值计算模长，避免滤波器削弱高频信号
+        float magnitude = sqrtf(ax_raw*ax_raw + ay_raw*ay_raw + az_raw*az_raw);
         
-        // 简单的摇晃检测
-        float total_acc = fabsf(ax_) + fabsf(ay_) + fabsf(az_);
-        if (total_acc > 2.5f) { // 阈值需要调试
-            shake_stable_count_++;
-            if (shake_stable_count_ >= 2) {
+        // 调试：每50次采样输出一次原始模长
+        static int raw_debug_counter = 0;
+        if (++raw_debug_counter >= 50) {
+            raw_debug_counter = 0;
+            ESP_LOGI("IMU_RAW", "RawMag=%.2fg (threshold: 1.4g=shake, 1.6g=fast)", magnitude);
+        }
+        
+        // 强效护盾逻辑：只要设备在动（模长偏离 1.0g 较大），就更新摇晃时间戳，保护 DetectTap
+        if (magnitude > 1.25f || magnitude < 0.75f) {
+            last_shake_time_raw_ = esp_timer_get_time() / 1000;
+        }
+
+        // 快速摇晃抱怨 (降低阈值到 1.6g)
+        if (magnitude > 1.6f) {
+            last_gesture_ = GESTURE_FAST_SHAKE;
+            ESP_LOGI("IMU", ">>> FAST SHAKE! Mag: %.2fg <<<", magnitude);
+        } else if (magnitude > 1.4f) { // 普通摇晃亮屏 (降低阈值到 1.4g)
+            if (++shake_stable_count_ >= 2) { 
                  last_gesture_ = GESTURE_SHAKE;
-                 ESP_LOGI("IMU", "Shake detected!");
                  shake_stable_count_ = 0;
+                 ESP_LOGI("IMU", "Shake detected, Mag: %.2fg", magnitude);
             }
         } else {
             shake_stable_count_ = 0;
         }
+    }
 
-        
-        // Debug: Check device state periodically
-        static int debug_check_counter = 0;
-        debug_check_counter++;
-        if (debug_check_counter >= 50) { // Every 5 seconds (at 100ms interval)
-            debug_check_counter = 0;
-            
-            if (chip_type_ == TYPE_BMI270) {
-                 uint8_t chip_id = 0;
-                 uint8_t pwr_ctrl = 0;
-                 uint8_t acc_conf = 0;
-                 uint8_t err_reg = 0;
-                 uint8_t status_reg = 0;
-                 uint8_t sensortime = 0;
-                 
-                 ReadRegs(0x00, &chip_id, 1);
-                 ReadRegs(0x7D, &pwr_ctrl, 1);
-                 ReadRegs(0x40, &acc_conf, 1);
-                 ReadRegs(0x02, &err_reg, 1);
-                 ReadRegs(0x03, &status_reg, 1);
-                 ReadRegs(0x18, &sensortime, 1); // Sensor time 0
-                 
-                 uint8_t temp_buf[2];
-                 ReadRegs(0x22, temp_buf, 2); // Internal Temperature
-                 
-                 ESP_LOGI("IMU", "BMI270 Diag: ID=%02X PWR=%02X CONF=%02X ERR=%02X STAT=%02X TIME=%02X", 
-                    chip_id, pwr_ctrl, acc_conf, err_reg, status_reg, sensortime);
-                 ESP_LOGI("IMU", "BMI270 Raw: [N/A] Temp=[%02X %02X]", 
-                    temp_buf[0], temp_buf[1]);
-                 
-                 // Auto-recover if Acc disabled
-                 if ((pwr_ctrl & 0x04) == 0) {
-                     ESP_LOGW("IMU", "BMI270 Acc disabled! Re-enabling...");
-                     WriteReg(0x7D, 0x04);
-                 }
-                 
-            } else if (chip_type_ == TYPE_MPU6050) {
-                uint8_t regs[2] = {0, 0};
-                ReadRegs(0x75, &regs[0], 1); // WHO_AM_I
-                ReadRegs(0x6B, &regs[1], 1); // PWR_MGMT_1
-                ESP_LOGI("IMU", "MPU6050 Diag: ID=0x%02X, PWR=0x%02X, AX=%.2f", regs[0], regs[1], ax_);
-                
-                if (regs[1] & 0x40) {
-                     ESP_LOGW("IMU", "MPU6050 Asleep! Waking...");
-                     WriteReg(0x6B, 0x00);
-                }
+    void DetectLift() {
+        static float last_az = -1.0f;
+        if (last_az > -0.2f && az_ < -0.85f) {
+            last_gesture_ = GESTURE_LIFT;
+            ESP_LOGI("IMU", "Lift to Wake (Back to Home) Detected!");
+        }
+        last_az = az_;
+    }
+
+    void DetectTap(float delta) {
+        static int64_t last_tap_time = 0;
+        static int64_t last_double_tap_time = 0;
+        int64_t now = esp_timer_get_time() / 1000;
+
+        // 核心防御：如果 800ms 内有明显的设备位移/摇晃，严禁识别成双击敲击
+        if (now - last_shake_time_raw_ < 800) {
+            last_tap_time = 0; 
+            return;
+        }
+
+        // 双击后的冷却时间
+        if (now - last_double_tap_time < 1000) return;
+
+        // 提高阈值到 1.0g，过滤掉普通手持波动
+        if (delta > 1.0f) {
+            int64_t interval = now - last_tap_time;
+            if (interval > 150 && interval < 600) {
+                last_gesture_ = GESTURE_DOUBLE_TAP;
+                ESP_LOGI("IMU", "Double Tap Detected! Interval: %d ms", (int)interval);
+                last_double_tap_time = now;
+                last_tap_time = 0;
+            } else {
+                last_tap_time = now;
             }
         }
     }
 
+public:
     GestureEvent GetLastGesture() {
         GestureEvent gesture = last_gesture_;
-        last_gesture_ = GESTURE_NONE;  // 读取后清除
+        last_gesture_ = GESTURE_NONE;
         return gesture;
     }
 
     bool IsFlipped() const { return is_flipped_; }
+    bool IsSideStanding() const {
+        return (fabsf(az_) < 0.6f) && (fabsf(ax_) > 0.7f || fabsf(ay_) > 0.7f);
+    }
     float GetAccelX() const { return ax_; }
     float GetAccelY() const { return ay_; }
     float GetAccelZ() const { return az_; }
 
 private:
+    uint8_t address_;  // I2C address
+    i2c_master_bus_handle_t bus_handle_;
     bool initialized_ = false;
     ChipType chip_type_ = TYPE_NONE;
     float ax_ = 0, ay_ = 0, az_ = 1.0f;
     bool is_flipped_ = false;
     int flip_stable_count_ = 0;
     int shake_stable_count_ = 0;
+    int64_t last_shake_time_raw_ = 0;
     GestureEvent last_gesture_ = GESTURE_NONE;
 };
 
@@ -794,6 +939,7 @@ private:
     uint32_t last_interaction_tick_ = 0;
     bool screen_off_ = false;
     bool flip_muted_ = false;  // 翻转静音状态
+    TickType_t last_shake_protection_tick_ = 0;  // 摇晃保护时间戳
 
     void InitializeI2c()
     {
@@ -1035,7 +1181,7 @@ private:
         int led_blink_counter = 0;
         
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(100)); // Check frequency increased to 100ms (10Hz) for better responsiveness
+            vTaskDelay(pdMS_TO_TICKS(50)); // 从 10Hz 提升到 20Hz，手势更灵敏
             
             // 手动执行 Charge 的更新
             if (board->charge_) {
@@ -1047,7 +1193,7 @@ private:
             // ============================================
             static int network_check_counter = 0;
             network_check_counter++;
-            if (network_check_counter >= 300) {  // 100ms * 300 = 30s
+            if (network_check_counter >= 600) {  // 50ms * 600 = 30s
                 network_check_counter = 0;
                 
                 wifi_ap_record_t ap_info;
@@ -1076,7 +1222,7 @@ private:
                 
                 // 每5秒打印一次加速度值用于调试
                 mpu_debug_counter++;
-                if (mpu_debug_counter >= 50) {  // 100ms * 50 = 5s
+                if (mpu_debug_counter >= 100) {  // 50ms * 100 = 5s
                     mpu_debug_counter = 0;
                     ESP_LOGI(TAG, "MPU6050: ax=%.2f ay=%.2f az=%.2f flipped=%d", 
                              board->mpu6050_->GetAccelX(),
@@ -1087,52 +1233,115 @@ private:
                 
                 auto gesture = board->mpu6050_->GetLastGesture();
                 
-                // 翻转静音功能
-                if (gesture == Mpu6050::GESTURE_FLIP) {
-                    // 设备翻转 -> 静音
-                    if (!board->flip_muted_) {
-                        board->flip_muted_ = true;
-                        ESP_LOGI(TAG, "Flip mute: MUTED");
-                        // 如果正在对话，退出对话
-                        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
-                            app.SetDeviceState(kDeviceStateIdle);
-                        }
-                        // LED闪烁提示
-                        if (board->status_led_) {
-                            board->status_led_->Blink(1, 100);
-                        }
+                // 辅助 Lambda：唤醒屏幕
+                auto wakeScreen = [board]() {
+                    board->last_interaction_tick_ = xTaskGetTickCount();
+                    // 强制唤醒屏幕，不依赖当前 screen_off_ 状态
+                    // 解决偶尔的状态不同步导致屏幕无法再次点亮的问题
+                    bool was_off = board->screen_off_;
+                    board->screen_off_ = false;
+                    board->GetBacklight()->RestoreBrightness();
+                    if (was_off) {
+                        ESP_LOGI(TAG, "wakeScreen: Screen was OFF -> ON");
+                    } else {
+                        ESP_LOGD(TAG, "wakeScreen: Screen was already ON (refreshing brightness)");
                     }
-                } else if (gesture == Mpu6050::GESTURE_UNFLIP) {
-                    // 设备翻转恢复 -> 取消静音
-                    if (board->flip_muted_) {
-                        board->flip_muted_ = false;
-                        ESP_LOGI(TAG, "Flip mute: UNMUTED");
-                        // 唤醒屏幕
-                        board->last_interaction_tick_ = xTaskGetTickCount();
-                        if (board->screen_off_) {
-                            board->screen_off_ = false;
-                            board->GetBacklight()->RestoreBrightness();
+                };
+                
+                // 处理手势事件
+                switch (gesture) {
+                    case Mpu6050::GESTURE_FLIP:
+                        if (!board->flip_muted_) {
+                            board->flip_muted_ = true;
+                            ESP_LOGI(TAG, "Flip mute: MUTED");
+                            if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+                                app.AbortSpeaking(kAbortReasonNone);
+                                app.SetDeviceState(kDeviceStateIdle);
+                            }
+                            if (board->status_led_) board->status_led_->Blink(1, 100);
                         }
-                        // LED闪烁提示
-                        if (board->status_led_) {
-                            board->status_led_->Blink(2, 100);
+                        break;
+                        
+                    case Mpu6050::GESTURE_UNFLIP:
+                        if (board->flip_muted_) {
+                            board->flip_muted_ = false;
+                            ESP_LOGI(TAG, "Flip mute: UNMUTED");
+                            wakeScreen();
+                            if (board->status_led_) board->status_led_->Blink(2, 100);
                         }
+                        break;
+                        
+                    case Mpu6050::GESTURE_DOUBLE_TAP:
+                        ESP_LOGI(TAG, "IMU double-tap: Toggle chat state");
+                        wakeScreen();
+                        app.ToggleChatState();
+                        break;
+                        
+                    case Mpu6050::GESTURE_SHAKE:
+                        ESP_LOGI(TAG, "IMU shake: Wake up screen");
+                        wakeScreen();
+                        break;
+                        
+                    case Mpu6050::GESTURE_FAST_SHAKE: {
+                        // AI 对话进行中时忽略摇晃（避免打断会话）
+                        if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+                            ESP_LOGD(TAG, "Ignoring shake during active conversation");
+                            break;
+                        }
+                        
+                        // 快摇事件冷却机制：防止 5 秒内反复触发
+                        static TickType_t last_fast_shake_tick = 0;
+                        TickType_t now = xTaskGetTickCount();
+                        if (now - last_fast_shake_tick > pdMS_TO_TICKS(5000)) {
+                            last_fast_shake_tick = now;
+                            
+                            // 记录摇晃保护时间戳，防止后续 6 秒内被误判为隐私姿态
+                            board->last_shake_protection_tick_ = now;
+                            
+                            ESP_LOGI(TAG, "IMU fast shake: Triggering AI complaint response");
+                            wakeScreen();
+                            
+                            // 向 AI 发送事件触发词，AI 会根据角色设定给出撒娇/抱怨回复
+                            app.SendIoTEvent("有人摇我，告诉他别摇了", "");
+                        }
+                        break;
                     }
+                        
+                    case Mpu6050::GESTURE_LIFT:
+                        ESP_LOGI(TAG, "IMU lift: Wake up screen");
+                        wakeScreen();
+                        break;
+                        
+                    default:
+                        break;
                 }
                 
-                // 摇晃唤醒功能
-                if (gesture == Mpu6050::GESTURE_SHAKE && !board->flip_muted_) {
-                    ESP_LOGI(TAG, "Shake wake: Activating!");
-                    board->last_interaction_tick_ = xTaskGetTickCount();
-                    // 唤醒屏幕
-                    if (board->screen_off_) {
-                        board->screen_off_ = false;
-                        board->GetBacklight()->RestoreBrightness();
+                // 侧立/翻转判定 -> 自动熄屏并关闭对话
+                // 注意：在摇晃后 6 秒内跳过检测，防止对话被误中断（摇晃保护）
+                static int off_confirm_counter = 0;
+                TickType_t current_tick = xTaskGetTickCount();
+                bool in_shake_protection = (current_tick - board->last_shake_protection_tick_) < pdMS_TO_TICKS(6000);
+                
+                bool is_privacy_pose = !in_shake_protection && 
+                                       (board->mpu6050_->IsSideStanding() || board->mpu6050_->IsFlipped());
+                
+                if (is_privacy_pose) {
+                    if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+                        ESP_LOGI(TAG, "Privacy pose -> Closing dialogue");
+                        app.AbortSpeaking(kAbortReasonNone);
+                        app.SetDeviceState(kDeviceStateIdle);
                     }
-                    // 开始对话 (如果处于空闲状态)
-                    if (state == kDeviceStateIdle) {
-                        app.ToggleChatState();
+                    
+                    if (!board->screen_off_) {
+                        if (++off_confirm_counter > 20) { // 1秒确认
+                            off_confirm_counter = 0;
+                            ESP_LOGI(TAG, "Privacy pose -> Auto screen off");
+                            board->screen_off_ = true;
+                            board->GetBacklight()->SetBrightness(0);
+                        }
                     }
+                } else {
+                    off_confirm_counter = 0; // 恢复正面时重置计数
                 }
             }
 
@@ -1251,13 +1460,34 @@ private:
     void InitializeCharge()
     {
         // 扫描I2C设备，确认硬件是否存在
-        ScanI2C();
+        // 扫描I2C设备，确认硬件是否存在
+        // ScanI2C(); // 禁用扫描以消除启动警告与延迟
 
         charge_ = new Charge(i2c_bus_, 0x55);
         
-        // 初始化MPU6050陀螺仪
-        mpu6050_ = new Mpu6050(i2c_bus_, 0x68);
-        ESP_LOGI(TAG, "MPU6050 gyroscope initialized");
+        // --- 增强: 自动探测 MPU6050/ICM 地址 ---
+        ESP_LOGI(TAG, "=== IMU Detection Start ===");
+        uint8_t mpu_addr = 0;
+        esp_err_t probe_68 = i2c_master_probe(i2c_bus_, 0x68, 50);
+        esp_err_t probe_69 = i2c_master_probe(i2c_bus_, 0x69, 50);
+        
+        ESP_LOGI(TAG, "Probe 0x68: %s", probe_68 == ESP_OK ? "FOUND" : "NOT FOUND");
+        ESP_LOGI(TAG, "Probe 0x69: %s", probe_69 == ESP_OK ? "FOUND" : "NOT FOUND");
+        
+        if (probe_68 == ESP_OK) {
+            mpu_addr = 0x68;
+        } else if (probe_69 == ESP_OK) {
+            mpu_addr = 0x69;
+        }
+
+        if (mpu_addr != 0) {
+            mpu6050_ = new Mpu6050(i2c_bus_, mpu_addr);
+            ESP_LOGI(TAG, "MPU6050 object created at 0x%02X", mpu_addr);
+        } else {
+            ESP_LOGE(TAG, "IMU NOT FOUND! Will try 0x68 anyway for debugging.");
+            // 强制创建以便调试
+            mpu6050_ = new Mpu6050(i2c_bus_, 0x68);
+        }
         
         // 初始化状态LED (绿色)
         status_led_ = new StatusLed(LED_G);
@@ -1423,8 +1653,8 @@ public:
         auto ssid_list = ssid_manager.GetSsidList();
         
         // 预设WiFi配置
-        const char* preset_ssid = "all_in_one";
-        const char* preset_password = "iotiotiot";
+        const char* preset_ssid = "CK";
+        const char* preset_password = "Chai962464";
         
         // 检查是否已有此SSID
         bool has_preset = false;

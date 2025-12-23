@@ -514,7 +514,7 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
         struct tm timeinfo;
         time(&now);
 
-        setenv("TZ", "GMT+0", 1);
+        setenv("TZ", "GMT-8", 1);
         tzset();
         localtime_r(&now, &timeinfo);
 

@@ -10,6 +10,7 @@
 #include "assets.h"
 #include "settings.h"
 
+#include <thread>
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -1008,6 +1009,45 @@ void Application::SendMcpMessage(const std::string& payload) {
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }
+    });
+}
+
+void Application::SendIoTEvent(const std::string& event_type, const std::string& description) {
+    // 在主任务中调度执行，确保线程安全
+    // 在主任务中调度执行状态更新
+    Schedule([this, event_type, description]() {
+        if (!protocol_) {
+            ESP_LOGE(TAG, "SendIoTEvent: Protocol not initialized");
+            return;
+        }
+        
+        // 步骤 1: 确保音频通道已打开
+        if (!protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "SendIoTEvent: Opening audio channel for shake response");
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                ESP_LOGE(TAG, "SendIoTEvent: Failed to open audio channel");
+                return;
+            }
+        }
+        
+        // 步骤 2: 进入监听模式
+        play_popup_on_listening_ = true;
+        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        
+        // 步骤 3: 启动后台线程等待音频预热，避免阻塞主线程
+        std::thread([this, event_type, description]() {
+            // 500ms 给音频编解码器和 I2S 足够的初始化时间
+            vTaskDelay(pdMS_TO_TICKS(500));
+            
+            // 步骤 4: 回到主线程发送 IoT 事件
+            Schedule([this, event_type, description]() {
+                if (protocol_) {
+                    protocol_->SendIoTEvent(event_type, description);
+                    ESP_LOGI(TAG, "SendIoTEvent: Sent '%s' to AI (Async)", event_type.c_str());
+                }
+            });
+        }).detach();
     });
 }
 

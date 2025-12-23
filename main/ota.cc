@@ -189,19 +189,36 @@ esp_err_t Ota::CheckVersion() {
         cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
         
         if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
             struct timeval tv;
-            double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
+            double raw_ts = timestamp->valuedouble;
+            int offset = 0;
             if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                offset = timezone_offset->valueint;
             }
             
-            tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
-            tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
+            ESP_LOGI(TAG, "Server time received: raw_ts=%.0f, offset=%d", raw_ts, offset);
+
+            // 自动判断：如果时间戳大于 1e11，认为是毫秒；否则认为是秒
+            long long sec, usec;
+            if (raw_ts > 100000000000.0) {
+                sec = (long long)(raw_ts / 1000);
+                usec = (long long)((long long)raw_ts % 1000) * 1000;
+            } else {
+                sec = (long long)raw_ts;
+                usec = 0;
+            }
+            
+            tv.tv_sec = (time_t)sec;
+            tv.tv_usec = (suseconds_t)usec;
             settimeofday(&tv, NULL);
             has_server_time_ = true;
+            
+            // 打印同步后的 UTC 时间字符串
+            char str[64];
+            struct tm tm_info;
+            gmtime_r(&tv.tv_sec, &tm_info);
+            strftime(str, sizeof(str), "%Y-%m-%d %H:%M:%S", &tm_info);
+            ESP_LOGI(TAG, "System UTC time synced to: %s", str);
         }
     } else {
         ESP_LOGW(TAG, "No server_time section found!");

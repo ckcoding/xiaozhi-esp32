@@ -78,6 +78,15 @@ void Protocol::SendMcpMessage(const std::string& payload) {
     SendText(message);
 }
 
+void Protocol::SendIoTEvent(const std::string& event_type, const std::string& description) {
+    // 发送简短的事件名作为唤醒词，让 AI 根据角色设定做出反应
+    // 注意：detect 状态只能接受短文本（类似唤醒词）
+    std::string message = "{\"session_id\":\"" + session_id_ + 
+                          "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + event_type + "\"}";
+    ESP_LOGI(TAG, "Sending event keyword: %s", event_type.c_str());
+    SendText(message);
+}
+
 bool Protocol::IsTimeout() const {
     const int kTimeoutSeconds = 120;
     auto now = std::chrono::steady_clock::now();
