@@ -63,6 +63,9 @@ static gfx_obj_t* g_obj_label_clock = nullptr;
 static gfx_obj_t* g_obj_anim_eye = nullptr;
 static gfx_obj_t* g_obj_anim_listen = nullptr;
 static gfx_obj_t* g_obj_img_status = nullptr;
+static gfx_obj_t* g_obj_label_battery = nullptr;
+static gfx_obj_t* g_obj_label_date = nullptr;
+
 
 // Track current icon to determine when to show time
 static std::string g_current_icon_type = ICON_WIFI_FAILED;
@@ -162,6 +165,9 @@ static void SetUIDisplayMode(const UIDisplayMode mode, EmoteDisplay* const displ
 
     gfx_obj_set_visible(g_obj_anim_listen, false);
     gfx_obj_set_visible(g_obj_label_clock, false);
+    gfx_obj_set_visible(g_obj_label_battery, false);
+    gfx_obj_set_visible(g_obj_label_date, false);
+
     gfx_obj_set_visible(g_obj_label_toast, false);
 
     // Show the selected control
@@ -178,6 +184,9 @@ static void SetUIDisplayMode(const UIDisplayMode mode, EmoteDisplay* const displ
     }
     case UIDisplayMode::SHOW_TIME:
         gfx_obj_set_visible(g_obj_label_clock, true);
+        gfx_obj_set_visible(g_obj_label_battery, true);
+        gfx_obj_set_visible(g_obj_label_date, true);
+
         break;
     case UIDisplayMode::SHOW_TIPS:
         gfx_obj_set_visible(g_obj_label_toast, true);
@@ -250,12 +259,30 @@ static void SetupUI(const gfx_handle_t engine_handle, EmoteDisplay* const displa
     gfx_label_set_font(g_obj_label_toast, (gfx_font_t)&BUILTIN_TEXT_FONT);
 
     g_obj_label_clock = gfx_label_create(engine_handle);
-    gfx_obj_align(g_obj_label_clock, GFX_ALIGN_TOP_MID, 0, 15);
-    gfx_obj_set_size(g_obj_label_clock, 200, 50);
+    gfx_obj_align(g_obj_label_clock, GFX_ALIGN_TOP_MID, 0, 50);
+    gfx_obj_set_size(g_obj_label_clock, 200, 35);
     gfx_label_set_text(g_obj_label_clock, "--:--");
     gfx_label_set_color(g_obj_label_clock, GFX_COLOR_HEX(0xFFFFFF));
     gfx_label_set_text_align(g_obj_label_clock, GFX_TEXT_ALIGN_CENTER);
     gfx_label_set_font(g_obj_label_clock, (gfx_font_t)&BUILTIN_TEXT_FONT);
+
+    g_obj_label_battery = gfx_label_create(engine_handle);
+    gfx_obj_align(g_obj_label_battery, GFX_ALIGN_TOP_MID, 0, 85);
+    gfx_obj_set_size(g_obj_label_battery, 150, 25);
+    gfx_label_set_text(g_obj_label_battery, "--%");
+    gfx_label_set_color(g_obj_label_battery, GFX_COLOR_HEX(0xFFFFFF));
+    gfx_label_set_text_align(g_obj_label_battery, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_font(g_obj_label_battery, (gfx_font_t)&BUILTIN_TEXT_FONT);
+
+    g_obj_label_date = gfx_label_create(engine_handle);
+    gfx_obj_align(g_obj_label_date, GFX_ALIGN_TOP_MID, 0, 115);
+    gfx_obj_set_size(g_obj_label_date, 180, 25);
+    gfx_label_set_text(g_obj_label_date, "--/--");
+    gfx_label_set_color(g_obj_label_date, GFX_COLOR_HEX(0x888888));
+    gfx_label_set_text_align(g_obj_label_date, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_font(g_obj_label_date, (gfx_font_t)&BUILTIN_TEXT_FONT);
+
+
 
     g_obj_anim_listen = gfx_anim_create(engine_handle);
     gfx_obj_align(g_obj_anim_listen, GFX_ALIGN_TOP_MID, 0, 5);
@@ -352,6 +379,7 @@ void EmoteEngine::SetIcon(const std::string &icon_name, EmoteDisplay* const disp
         g_icon_img_dsc.data_size = icon_data.size - sizeof(gfx_image_header_t);
 
         gfx_img_set_src(g_obj_img_status, &g_icon_img_dsc);
+        gfx_obj_set_visible(g_obj_img_status, true);
     } else {
         ESP_LOGW(TAG, "SetIcon: No icon data found for %s", icon_name.c_str());
     }
@@ -446,7 +474,8 @@ void EmoteDisplay::SetStatus(const char* const status)
         engine_->SetIcon(ICON_MIC, this);
     } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
         SetUIDisplayMode(UIDisplayMode::SHOW_TIME, this);
-        engine_->SetIcon(ICON_BATTERY, this);
+        g_current_icon_type = ICON_BATTERY;
+        gfx_obj_set_visible(g_obj_img_status, false);
     } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
         SetUIDisplayMode(UIDisplayMode::SHOW_TIPS, this);
         engine_->SetIcon(ICON_SPEAKER_ZZZ, this);
@@ -494,15 +523,37 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
         bool charging = false, discharging = false;
         Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging);
 
+        // 时间字符串
         char time_str[16];
-        if (battery_level >= 0) {
-            snprintf(time_str, sizeof(time_str), "%02d:%02d %d%%", timeinfo.tm_hour, timeinfo.tm_min, battery_level);
+        snprintf(time_str, sizeof(time_str), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+        
+        // 日期字符串 (格式: 周X MM/DD)
+        const char* weekdays[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+        char date_str[32];
+        snprintf(date_str, sizeof(date_str), "%s %02d/%02d", 
+                 weekdays[timeinfo.tm_wday], timeinfo.tm_mon + 1, timeinfo.tm_mday);
+        
+        // 电量字符串
+        char batt_str[32];
+        gfx_color_t color = GFX_COLOR_HEX(0xFFFFFF);
+        if (charging) {
+            snprintf(batt_str, sizeof(batt_str), "⚡ %d%%", battery_level);
+            color = GFX_COLOR_HEX(0x00FF00);
         } else {
-            snprintf(time_str, sizeof(time_str), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+            snprintf(batt_str, sizeof(batt_str), "%d%%", battery_level);
+            if (battery_level < 20) {
+                color = GFX_COLOR_HEX(0xFF0000);
+            } else {
+                color = GFX_COLOR_HEX(0xFFFFFF);
+            }
         }
 
         DisplayLockGuard lock(this);
         gfx_label_set_text(g_obj_label_clock, time_str);
+        gfx_label_set_text(g_obj_label_battery, batt_str);
+        gfx_label_set_text(g_obj_label_date, date_str);
+
+        gfx_label_set_color(g_obj_label_battery, color);
         SetUIDisplayMode(UIDisplayMode::SHOW_TIME, this);
     }
 }
@@ -611,6 +662,9 @@ void EmoteDisplay::AddTextFont(std::shared_ptr<LvglFont> text_font)
     }
     if (g_obj_label_clock && text_font_) {
         gfx_label_set_font(g_obj_label_clock, const_cast<void*>(static_cast<const void*>(text_font_->font())));
+    }
+    if (g_obj_label_battery && text_font_) {
+        gfx_label_set_font(g_obj_label_battery, const_cast<void*>(static_cast<const void*>(text_font_->font())));
     }
 }
 
